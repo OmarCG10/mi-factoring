@@ -445,6 +445,17 @@
 
   /* Pantalla de inicio de sesión */
   #signin-screen .signin-pig { font-size: 0; line-height: 0; transform: none; }
+
+  /* Importar historial */
+  #import-preview .imp-bloque { border: 1px solid var(--lila-2); border-radius: 12px; padding: 12px 14px; margin-bottom: 12px; display: grid; gap: 6px; }
+  #import-preview .imp-bloque-tit { font-size: 16px; }
+  #import-preview .imp-det, #import-preview .imp-nota, #import-preview .imp-omitidas { font-size: 13px; color: var(--uva-2); }
+  #import-preview .imp-nota { margin: 12px 0 0; }
+  #import-preview select { border: 1px solid #B5C6DA; border-radius: 10px; padding: 9px 10px; font: 500 15px 'Figtree', sans-serif; background: #fff; color: var(--uva); max-width: 320px; }
+  #import-preview .imp-err { color: var(--sandia); }
+  #import-preview .imp-err-list { margin: 6px 0 0; padding-left: 18px; color: var(--sandia); }
+  #import-preview .imp-acciones { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  #import-preview .imp-acciones .secondary { margin-top: 18px; }
 </style>
 
 </head>
@@ -488,14 +499,17 @@
         <div class="more-menu">
           <button class="secondary" id="btn-sheets-connect">Conectar Google Sheets</button>
           <a id="sheets-link" href="#" target="_blank" style="display:none; text-decoration:none;">Abrir en Sheets ↗</a>
+          <button class="secondary" id="btn-import-historial">📥 Importar historial (Excel)</button>
           <button class="secondary" id="btn-backup">Descargar respaldo (JSON)</button>
           <button class="secondary" id="btn-restore">Importar respaldo</button>
         </div>
       </details>
       <input type="file" id="import-file-input" accept="application/json" style="display:none">
+      <input type="file" id="historial-file-input" accept=".xlsx,.xls,.csv" style="display:none">
     </div>
   </div>
   <div id="sheets-status" class="sync-status" style="margin-bottom:20px;"></div>
+  <div class="panel" id="import-preview" style="display:none;"></div>
 
 
   <div class="tab-bar-wrap">
@@ -1742,7 +1756,232 @@ async function handleImportFile(evt) {
   }
 }
 
+// ============================================================
+// IMPORTAR HISTORIAL DESDE EXCEL (reporte de la plataforma)
+// Columnas esperadas: Fecha, Cliente, Codigo de subasta, Inversion, Moneda,
+// Retorno mensual (%), Fecha de cierre de subasta, Fecha de pago, Estado
+// ============================================================
+let importPreview = null;
+
+function normCol(s) { return normalizar(s).replace(/[^a-z0-9]/g, ''); }
+
+// Convierte lo que venga en la celda (Date, número de serie de Excel, "dd/mm/aaaa", "aaaa-mm-dd") a "aaaa-mm-dd"
+function aFechaISO(v) {
+  if (v === null || v === undefined || v === '') return null;
+  const pad = n => String(n).padStart(2, '0');
+  if (v instanceof Date && !isNaN(v)) {
+    // La librería de Excel entrega la fecha en hora local: se toma el día tal cual
+    return v.getFullYear() + '-' + pad(v.getMonth() + 1) + '-' + pad(v.getDate());
+  }
+  if (typeof v === 'number' && isFinite(v)) {
+    const d = new Date(Math.round((v - 25569) * 86400000)); // serie de Excel → UTC
+    return d.getUTCFullYear() + '-' + pad(d.getUTCMonth() + 1) + '-' + pad(d.getUTCDate());
+  }
+  const s = String(v).trim();
+  let m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (m) return m[1] + '-' + pad(m[2]) + '-' + pad(m[3]);
+  m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+  if (m) return m[3] + '-' + pad(m[2]) + '-' + pad(m[1]);
+  return null;
+}
+
+function aNumero(v) {
+  if (typeof v === 'number') return v;
+  const n = parseFloat(String(v ?? '').replace(/[^0-9.,-]/g, '').replace(/,(?=\d{3}\b)/g, '').replace(',', '.'));
+  return isFinite(n) ? n : NaN;
+}
+
+// Lógica pura (sin pantalla): recibe filas del Excel y las subastas actuales; devuelve qué se importaría
+function construirImportacion(filas, entriesActuales) {
+  const res = { nuevas: [], omitidas: { rechazadas: 0, duplicadas: 0, errores: [] } };
+  const codigosVistos = new Set();
+  const yaExiste = (codigo, empresa, monto, fechaInv) => entriesActuales.some(x => {
+    if (x.codigoSubasta && x.codigoSubasta === codigo) return true;
+    if (codigo && String(x.empresa || '').includes(codigo)) return true;
+    // Registrada a mano sin código: misma empresa (inicio del nombre), mismo monto y misma fecha de inversión
+    const a = normalizar(String(x.empresa || '').split('—')[0]).trim();
+    const b = normalizar(empresa).trim();
+    return a && b && (a.startsWith(b.slice(0, 12)) || b.startsWith(a.slice(0, 12))) &&
+      Math.abs(Number(x.monto) - monto) < 0.01 && x.fechaInv === fechaInv;
+  });
+
+  filas.forEach((f, i) => {
+    const filaN = i + 2; // fila en Excel (1 = encabezados)
+    const k = {};
+    Object.keys(f).forEach(c => { k[normCol(c)] = f[c]; });
+    const estadoTxt = normalizar(k.estado).trim();
+    if (estadoTxt.startsWith('rechaz')) { res.omitidas.rechazadas++; return; }
+
+    const empresa = String(k.cliente ?? '').trim();
+    const codigo = String(k.codigodesubasta ?? '').trim();
+    const monto = Math.round(aNumero(k.inversion) * 100) / 100;
+    const moneda = String(k.moneda ?? '').toUpperCase().includes('USD') ? 'USD' : 'PEN';
+    const tasaMensual = aNumero(k.retornomensual);
+    const fechaInv = aFechaISO(k.fechadecierredesubasta) || aFechaISO(k.fecha);
+    const fechaPago = aFechaISO(k.fechadepago);
+
+    const problemas = [];
+    if (!empresa) problemas.push('sin cliente');
+    if (!(monto > 0)) problemas.push('monto inválido');
+    if (!(tasaMensual > 0)) problemas.push('tasa inválida');
+    if (!fechaValida(fechaInv)) problemas.push('fecha de inversión inválida');
+    if (!fechaValida(fechaPago)) problemas.push('fecha de pago inválida');
+    if (!problemas.length && fechaPago <= fechaInv) problemas.push('fecha de pago no es posterior a la inversión');
+    if (problemas.length) { res.omitidas.errores.push(`Fila ${filaN} (${empresa || 'sin nombre'}): ${problemas.join(', ')}`); return; }
+
+    if ((codigo && codigosVistos.has(codigo)) || yaExiste(codigo, empresa, monto, fechaInv)) { res.omitidas.duplicadas++; return; }
+    if (codigo) codigosVistos.add(codigo);
+
+    // La plataforma da retorno MENSUAL; la app trabaja con TEA (base 360). Es la misma tasa: (1+m)^12 − 1.
+    const tea = Math.round((Math.pow(1 + tasaMensual / 100, 12) - 1) * 100 * 10000) / 10000;
+
+    // Opcional: cobro real tomado de los movimientos de la plataforma
+    // "Pagos de capital" = "2025-01-08: 386.06; 2025-02-28: 335.55" · "Interes ganado (neto)" = lo que entró a la cuenta
+    let pagosCapital = null, gananciaRealManual = null;
+    const txtPagos = String(k.pagosdecapital ?? '').trim();
+    if (txtPagos) {
+      const ps = txtPagos.split(';').map(x => x.trim()).filter(Boolean).map(x => {
+        const [f, m] = x.split(':');
+        return { fecha: aFechaISO(f.trim()), monto: Math.round(aNumero(m) * 100) / 100 };
+      });
+      const sumaOk = Math.abs(ps.reduce((a, p) => a + p.monto, 0) - monto) < 0.01;
+      if (ps.length && sumaOk && ps.every(p => fechaValida(p.fecha) && p.monto > 0 && p.fecha >= fechaInv)) {
+        pagosCapital = ps.sort((a, b) => (a.fecha < b.fecha ? -1 : 1));
+      } else {
+        res.omitidas.errores.push(`Fila ${filaN} (${empresa}): los pagos de capital no cuadran con el monto; se importa con cobro estimado`);
+      }
+    }
+    const netoTxt = k.interesganadoneto;
+    if (pagosCapital && netoTxt !== '' && netoTxt !== null && netoTxt !== undefined && isFinite(aNumero(netoTxt))) {
+      // La plataforma abona el interés ya NETO; la app guarda la ganancia BRUTA y le descuenta comisión, IGV e IR.
+      const factorNeto = 1 - 0.10 - 0.10 * 0.18 - 0.05;
+      gananciaRealManual = Math.round(aNumero(netoTxt) / factorNeto * 10000) / 10000;
+    }
+    const cobrado = estadoTxt.startsWith('cobrad') || !!pagosCapital;
+    res.nuevas.push({
+      id: 'imp-' + (codigo || (Date.now().toString(36) + '-' + i)),
+      empresa: codigo ? `${empresa} — ${codigo}` : empresa,
+      codigoSubasta: codigo || null,
+      monto, moneda,
+      tasa: tea, tasaUnidad: 'TEA', tasaMensualOrigen: tasaMensual,
+      comision: 10, igv: 18, ir: 5,
+      fechaInv, fechaPago,
+      // Cobradas sin datos del comprobante: la app toma la fecha de pago y estima la ganancia (se puede corregir con "Editar cobro")
+      fechaRealPago: pagosCapital ? pagosCapital[pagosCapital.length - 1].fecha : (cobrado ? fechaPago : null),
+      ...(pagosCapital ? { pagosCapital } : {}),
+      ...(gananciaRealManual !== null ? { gananciaRealManual } : {}),
+      estado: cobrado ? 'cobrado' : 'pendiente',
+      importado: true,
+    });
+  });
+  return res;
+}
+
+function abrirImportarHistorial() {
+  if (typeof XLSX === 'undefined') { alert('No se pudo cargar la librería de Excel. Revisa tu conexión e intenta de nuevo.'); return; }
+  document.getElementById('historial-file-input').click();
+}
+
+async function leerArchivoHistorial(evt) {
+  const file = evt.target.files[0];
+  evt.target.value = '';
+  if (!file) return;
+  try {
+    const wb = XLSX.read(await file.arrayBuffer(), { type: 'array', cellDates: true });
+    const ws = wb.Sheets[wb.SheetNames[0]];
+    const filas = XLSX.utils.sheet_to_json(ws, { defval: '', raw: true });
+    const cols = filas.length ? Object.keys(filas[0]).map(normCol) : [];
+    const faltan = ['cliente', 'inversion', 'moneda', 'retornomensual', 'fechadepago', 'estado'].filter(c => !cols.includes(c));
+    if (faltan.length) { alert('El archivo no tiene las columnas esperadas. Faltan: ' + faltan.join(', ')); return; }
+    importPreview = construirImportacion(filas, entries);
+    importPreview.archivo = file.name;
+    importPreview.totalFilas = filas.length;
+    renderImportPreview();
+  } catch (e) {
+    console.error(e);
+    alert('No se pudo leer el Excel. Verifica que sea el reporte de la plataforma (.xlsx).');
+  }
+}
+
+function opcionesPestana(moneda) {
+  const propias = tabs.filter(t => (t.moneda || 'PEN') === moneda);
+  const activa = tabs.find(t => t.id === activeTabId);
+  const pref = (activa && activa.moneda === moneda) ? activa.id : (propias[0] ? propias[0].id : '__nueva');
+  return propias.map(t => `<option value="${t.id}" ${t.id === pref ? 'selected' : ''}>${esc(t.persona)} (${moneda === 'USD' ? 'US$' : 'S/'})</option>`).join('') +
+    `<option value="__nueva" ${pref === '__nueva' ? 'selected' : ''}>Crear pestaña nueva en ${moneda === 'USD' ? 'dólares' : 'soles'}</option>`;
+}
+
+function renderImportPreview() {
+  const box = document.getElementById('import-preview');
+  if (!importPreview) { box.innerHTML = ''; box.style.display = 'none'; return; }
+  const p = importPreview;
+  const cuenta = (mon, est) => p.nuevas.filter(n => n.moneda === mon && (est ? n.estado === est : true));
+  const suma = arr => arr.reduce((s, n) => s + n.monto, 0);
+  const f2 = (n, mon) => (mon === 'USD' ? 'US$ ' : 'S/ ') + n.toLocaleString('es-PE', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const bloque = mon => {
+    const todas = cuenta(mon);
+    if (!todas.length) return '';
+    return `
+      <div class="imp-bloque">
+        <div class="imp-bloque-tit">${mon === 'USD' ? 'Dólares' : 'Soles'}: <b>${todas.length}</b> subasta(s) · ${f2(suma(todas), mon)}</div>
+        <div class="imp-det">${cuenta(mon, 'cobrado').length} cobradas (${todas.filter(n => n.gananciaRealManual !== undefined).length} con ganancia real) · ${cuenta(mon, 'pendiente').length} por cobrar</div>
+        <div class="field"><label>Guardar en la pestaña</label>
+          <select id="imp-tab-${mon}">${opcionesPestana(mon)}</select></div>
+      </div>`;
+  };
+  const errores = p.omitidas.errores;
+  box.style.display = 'block';
+  box.innerHTML = `
+    <h2>Importar historial <span class="h2-note">${esc(p.archivo)} · ${p.totalFilas} fila(s)</span></h2>
+    ${p.nuevas.length ? bloque('PEN') + bloque('USD') : '<div class="empty">No hay subastas nuevas para importar: ya están todas registradas.</div>'}
+    <div class="imp-omitidas">
+      No se importan: <b>${p.omitidas.rechazadas}</b> rechazada(s) · <b>${p.omitidas.duplicadas}</b> que ya tenías registrada(s)${errores.length ? ` · <b class="imp-err">${errores.length}</b> con datos por revisar` : ''}
+      ${errores.length ? `<ul class="imp-err-list">${errores.slice(0, 10).map(x => `<li>${esc(x)}</li>`).join('')}${errores.length > 10 ? `<li>…y ${errores.length - 10} más</li>` : ''}</ul>` : ''}
+    </div>
+    <p class="imp-nota">Las cobradas "con ganancia real" usan las fechas y el interés que te abonó la plataforma. Las demás cobradas quedan con la fecha de pago del reporte y una ganancia <b>estimada</b>; puedes corregirlas con "Editar cobro". Antes de importar se descarga un respaldo automático de tus datos actuales.</p>
+    <div class="imp-acciones">
+      ${p.nuevas.length ? `<button class="primary" onclick="confirmarImportacion()">Importar ${p.nuevas.length} subasta(s)</button>` : ''}
+      <button class="secondary" onclick="cancelarImportacion()">Cancelar</button>
+    </div>`;
+  box.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+function cancelarImportacion() { importPreview = null; renderImportPreview(); }
+
+async function confirmarImportacion() {
+  if (!importPreview || !importPreview.nuevas.length) return;
+  if (!cargaOk) { alert('Tus datos no cargaron bien desde la nube. Recarga la página antes de importar.'); return; }
+  exportBackup(); // respaldo de seguridad antes de tocar nada
+
+  const destino = {};
+  for (const mon of ['PEN', 'USD']) {
+    if (!importPreview.nuevas.some(n => n.moneda === mon)) continue;
+    let id = document.getElementById('imp-tab-' + mon)?.value;
+    if (!id || id === '__nueva') {
+      id = 'tab-' + Date.now().toString() + '-' + mon;
+      const base = tabs[0] ? tabs[0].persona : 'Mis subastas';
+      tabs.push({ id, persona: base, moneda: mon });
+    }
+    destino[mon] = id;
+  }
+  // Vuelve a revisar duplicados contra lo último cargado, por si cambió algo mientras estaba abierta la vista previa
+  const ids = new Set(entries.map(e => e.id));
+  const nuevas = importPreview.nuevas.filter(n => !ids.has(n.id)).map(n => {
+    const { moneda, ...resto } = n;
+    return { ...resto, tabId: destino[moneda] };
+  });
+  entries = entries.concat(nuevas);
+  const n = nuevas.length;
+  importPreview = null;
+  renderImportPreview();
+  await saveAll();
+  render();
+  celebrar(`¡Se importaron ${n} subasta(s)!`);
+}
+
 document.getElementById('btn-add').addEventListener('click', addEntry);
+document.getElementById('btn-import-historial').addEventListener('click', abrirImportarHistorial);
+document.getElementById('historial-file-input').addEventListener('change', leerArchivoHistorial);
 document.querySelectorAll('.more-menu button, .more-menu a').forEach(el =>
   el.addEventListener('click', () => document.getElementById('more-menu').removeAttribute('open')));
 document.addEventListener('click', (ev) => {
