@@ -164,6 +164,9 @@
   .summary .value.teal { color: #0B7F5C; }
   .summary .value.danger { color: var(--sandia); }
   .summary .card.wide { grid-column: span 2; }
+  .summary .hint-card { font-size: 11.5px; color: var(--uva-2); margin-top: 4px; line-height: 1.3; }
+  .summary .hint-card.warn { color: var(--sandia); font-weight: 600; }
+  .entry-ir.warn { color: var(--sandia); font-weight: 600; }
   @media (max-width: 640px) {
     .summary { grid-template-columns: 1fr 1fr; }
     .summary .card.wide { grid-column: span 1; }
@@ -510,7 +513,7 @@
       <div class="value teal" id="sum-cobrada">S/ 0.00</div>
     </div>
     <div class="card mango">
-      <div class="label">Ganancia en camino (bruta)</div>
+      <div class="label">Ganancia en camino (neta)</div>
       <div class="value gold" id="sum-ganancia-pendiente">S/ 0.00</div>
     </div>
     <div class="card mango">
@@ -520,6 +523,7 @@
     <div class="card">
       <div class="label">Rendimiento real anual (neto)</div>
       <div class="value teal" id="sum-rend-real">—</div>
+      <div class="hint-card" id="sum-rend-nota"></div>
     </div>
     <div class="card wide">
       <div class="label">Todo lo que invertiste</div>
@@ -622,6 +626,15 @@ function getPagosCapital(e, fechaRealEfectiva) {
   return [{ fecha: fechaRealEfectiva, monto: e.monto }];
 }
 
+// Fecha válida AAAA-MM-DD con año razonable (evita años mal tipeados como 20245 o 0024)
+function fechaValida(s) {
+  if (typeof s !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
+  const y = Number(s.slice(0, 4));
+  return y >= 2000 && y <= 2100 && !isNaN(new Date(s + 'T00:00:00').getTime());
+}
+
+function num(v) { return typeof v === 'number' && isFinite(v); }
+
 function diffDays(d1, d2) {
   const a = new Date(d1 + 'T00:00:00'), b = new Date(d2 + 'T00:00:00');
   return Math.round((b - a) / 86400000);
@@ -652,9 +665,9 @@ function calcularDescuentos(gananciaBruta, comisionPct, igvPct, irPct) {
 }
 
 function computeEntry(e) {
-  const ir = (e.ir === undefined || e.ir === null || e.ir === '') ? 5 : e.ir;
-  const comisionPct = (e.comision === undefined || e.comision === null || e.comision === '') ? 10 : e.comision;
-  const igvPct = (e.igv === undefined || e.igv === null || e.igv === '') ? 18 : e.igv;
+  const ir = num(Number(e.ir)) && e.ir !== '' && e.ir !== null ? Number(e.ir) : 5;
+  const comisionPct = num(Number(e.comision)) && e.comision !== '' && e.comision !== null ? Number(e.comision) : 10;
+  const igvPct = num(Number(e.igv)) && e.igv !== '' && e.igv !== null ? Number(e.igv) : 18;
   // Entradas nuevas: tasa anual (TEA). Entradas creadas antes de este cambio: se respeta su base mensual (TEM) original.
   const unidad = e.tasaUnidad === 'TEM' ? 'TEM' : 'TEA';
   const baseDias = unidad === 'TEM' ? 30 : DIAS_ANIO;
@@ -923,26 +936,39 @@ function render() {
 
   const container = document.getElementById('entries');
   let totalHistorico = 0, capitalEnCurso = 0, gananciaCobrada = 0, porCobrar = 0, vencidas = 0;
-  let gananciaEstBrutaPendiente = 0;
-  let sumaGananciaRealNeta = 0, sumaCapitalDias = 0;
+  let gananciaEstNetaPendiente = 0;
+  const tasasNetasCobradas = [];   // tasa real anual neta de cada subasta cobrada
+  const conProblema = [];          // subastas con datos que no se pueden calcular (ej. fecha mal tipeada)
 
   const withComputed = tabEntries.map(e => ({ e, c: computeEntry(e) }));
 
+  // Una subasta con un dato inválido ya no "contamina" los totales: se omite y se avisa.
   withComputed.forEach(({ e, c }) => {
-    totalHistorico += e.monto;
+    const fechasOk = fechaValida(e.fechaInv) && fechaValida(e.fechaPago) &&
+      (!c.real || c.real.pagos.every(p => fechaValida(p.fecha)));
+    c.problema = !fechasOk || !num(Number(e.monto)) ||
+      (c.real ? !num(c.real.gananciaRealNeta) || !num(c.real.rendAnualizadoRealNeto) : !num(c.gananciaEstNeta));
+    if (c.problema) conProblema.push(e.empresa);
+  });
+
+  withComputed.forEach(({ e, c }) => {
+    if (num(Number(e.monto))) totalHistorico += Number(e.monto);
+    if (c.problema) return;
     if (c.estado === 'cobrado') {
       gananciaCobrada += c.real.gananciaRealNeta;
-      sumaGananciaRealNeta += c.real.gananciaRealNeta;
-      sumaCapitalDias += c.real.capitalDias / DIAS_ANIO;
+      tasasNetasCobradas.push(c.real.rendAnualizadoRealNeto);
     } else {
       capitalEnCurso += e.monto;
       porCobrar += e.monto + c.gananciaEstNeta;
-      gananciaEstBrutaPendiente += c.gananciaEstBruta;
+      gananciaEstNetaPendiente += c.gananciaEstNeta;
       if (c.estado === 'vencido') vencidas++;
     }
   });
 
-  const rendimientoRealPortafolio = sumaCapitalDias > 0 ? (sumaGananciaRealNeta / sumaCapitalDias) * 100 : null;
+  // Rendimiento real anual neto = promedio simple de la tasa real anual neta de todas las subastas cobradas
+  const rendimientoRealPortafolio = tasasNetasCobradas.length
+    ? tasasNetasCobradas.reduce((s, x) => s + x, 0) / tasasNetasCobradas.length
+    : null;
 
   if (tabEntries.length === 0) {
     container.innerHTML = '<div class="empty">Aún no hay subastas registradas. Agrega la primera arriba.</div>';
@@ -999,6 +1025,7 @@ function render() {
               <div class="entry-meta">Invertido ${formatDate(e.fechaInv)} · vence ${formatDate(e.fechaPago)}</div>
               <div class="entry-meta">${e.tasa}% ${c.unidad} · plazo ${c.diasEst} días</div>
               ${metaLine2}
+              ${c.problema ? '<div class="entry-ir warn">⚠ Revisa las fechas o montos de esta subasta (toca "Editar" o "Editar cobro"). No se está sumando en los totales.</div>' : ''}
               <span class="badge ${badgeClass}">${badgeText}</span>
             </div>
             <div class="entry-right">
@@ -1026,9 +1053,19 @@ function render() {
     : `Repartida en ${nCurso} ${nCurso === 1 ? 'subasta que aún no te paga' : 'subastas que aún no te pagan'}`;
   document.getElementById('sum-cobrada').textContent = fmt(gananciaCobrada);
   document.getElementById('sum-porcobrar').textContent = fmt(porCobrar);
-  document.getElementById('sum-ganancia-pendiente').textContent = fmt(gananciaEstBrutaPendiente);
+  document.getElementById('sum-ganancia-pendiente').textContent = fmt(gananciaEstNetaPendiente);
   document.getElementById('sum-vencidas').textContent = vencidas;
   document.getElementById('sum-rend-real').textContent = rendimientoRealPortafolio === null ? '—' : rendimientoRealPortafolio.toFixed(2) + '%';
+  const rendNota = document.getElementById('sum-rend-nota');
+  if (conProblema.length) {
+    rendNota.className = 'hint-card warn';
+    rendNota.textContent = `⚠ ${conProblema.length} subasta(s) con datos por revisar no se cuentan: ${conProblema.slice(0, 3).join(', ')}${conProblema.length > 3 ? '…' : ''}`;
+  } else {
+    rendNota.className = 'hint-card';
+    rendNota.textContent = tasasNetasCobradas.length
+      ? `Promedio de ${tasasNetasCobradas.length} subasta(s) cobrada(s)`
+      : 'Aparece cuando marques subastas como cobradas';
+  }
   const vencidasCard = document.getElementById('card-vencidas');
   const vencidasVal = document.getElementById('sum-vencidas');
   if (vencidas > 0) {
@@ -1193,6 +1230,11 @@ async function addEntry() {
     errorEl.style.display = 'block';
     return;
   }
+  if (!fechaValida(data.fechaInv) || !fechaValida(data.fechaPago)) {
+    errorEl.textContent = 'Revisa las fechas: el año debe tener 4 dígitos (por ejemplo 2024).';
+    errorEl.style.display = 'block';
+    return;
+  }
   if (data.fechaPago <= data.fechaInv) {
     errorEl.textContent = 'La fecha de pago estimada debe ser posterior a la fecha de inversión.';
     errorEl.style.display = 'block';
@@ -1347,6 +1389,9 @@ async function confirmarCobro(id) {
   const pagos = cobroDraft.pagos.map(p => ({ fecha: p.fecha, monto: Math.round(parseFloat(p.monto) * 100) / 100 }));
   if (pagos.some(p => !p.fecha || isNaN(p.monto) || p.monto <= 0)) {
     return mostrarError('Cada pago de capital necesita fecha y un monto mayor a cero.');
+  }
+  if (pagos.some(p => !fechaValida(p.fecha))) {
+    return mostrarError('Revisa las fechas de pago: el año debe tener 4 dígitos (por ejemplo 2025).');
   }
   if (pagos.some(p => p.fecha < e.fechaInv)) {
     return mostrarError(`Las fechas de pago no pueden ser anteriores a la fecha de inversión (${formatDate(e.fechaInv)}).`);
